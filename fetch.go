@@ -57,24 +57,37 @@ type SectionPartial struct {
 //
 //	imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}
 type FetchItemBodySection struct {
+	Peek bool
+
+	Part []int
+
 	Specifier       PartSpecifier
-	Part            []int
 	HeaderFields    []string
 	HeaderFieldsNot []string
-	Partial         *SectionPartial
-	Peek            bool
+
+	Partial *SectionPartial
 }
 
 // FetchItemBinarySection is a FETCH BINARY[] data item.
 type FetchItemBinarySection struct {
-	Part    []int
+	Peek bool
+
+	Part []int
+
+	Specifier       PartSpecifier
+	HeaderFields    []string
+	HeaderFieldsNot []string
+
 	Partial *SectionPartial
-	Peek    bool
 }
 
 // FetchItemBinarySectionSize is a FETCH BINARY.SIZE[] data item.
 type FetchItemBinarySectionSize struct {
 	Part []int
+
+	Specifier       PartSpecifier
+	HeaderFields    []string
+	HeaderFieldsNot []string
 }
 
 // Envelope is the envelope structure of a message.
