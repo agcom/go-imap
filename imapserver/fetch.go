@@ -126,26 +126,56 @@ func handleFetchAtt(dec *imapwire.Decoder, attName string, options *imap.FetchOp
 		writerOptions.obsolete[bs] = attName
 		options.BodySection = append(options.BodySection, bs)
 	case "BINARY", "BINARY.PEEK":
-		part, err := readSectionBinary(dec)
-		if err != nil {
-			return err
+		if !dec.ExpectSpecial('[') {
+			return dec.Err()
 		}
+
+		spec := &fetchSectionSpec{}
+
+		if !dec.Special(']') {
+			var err error
+			spec, err = readFetchSectionSpec(dec)
+			if err != nil {
+				return err
+			}
+		}
+		if !dec.ExpectSpecial(']') {
+			return dec.Err()
+		}
+
 		partial, err := maybeReadPartial(dec)
 		if err != nil {
 			return err
 		}
+
 		bs := &imap.FetchItemBinarySection{
-			Part:    part,
 			Partial: partial,
 			Peek:    attName == "BINARY.PEEK",
 		}
+		unbundleFetchItemSectionSpec(bs, spec)
+
 		options.BinarySection = append(options.BinarySection, bs)
 	case "BINARY.SIZE":
-		part, err := readSectionBinary(dec)
-		if err != nil {
-			return err
+		if !dec.ExpectSpecial('[') {
+			return dec.Err()
 		}
-		bss := &imap.FetchItemBinarySectionSize{Part: part}
+
+		spec := &fetchSectionSpec{}
+
+		if !dec.Special(']') {
+			var err error
+			spec, err = readFetchSectionSpec(dec)
+			if err != nil {
+				return err
+			}
+		}
+		if !dec.ExpectSpecial(']') {
+			return dec.Err()
+		}
+
+		bss := &imap.FetchItemBinarySectionSize{}
+		unbundleFetchItemSectionSpec(bss, spec)
+
 		options.BinarySectionSize = append(options.BinarySectionSize, bss)
 	case "BODY":
 		if !dec.Special('[') {
@@ -210,13 +240,95 @@ func readSection(dec *imapwire.Decoder, section *imap.FetchItemBodySection) erro
 		return nil
 	}
 
+	sectionSpec, err := readFetchSectionSpec(dec)
+	if err != nil {
+		return err
+	}
+
+	if !dec.ExpectSpecial(']') {
+		return dec.Err()
+	}
+
+	section.Part = sectionSpec.Part
+	section.Specifier = sectionSpec.Specifier
+	section.HeaderFields = sectionSpec.HeaderFields
+	section.HeaderFieldsNot = sectionSpec.HeaderFieldsNot
+
+	return nil
+}
+
+type fetchSectionSpec struct {
+	Part []int
+
+	Specifier       imap.PartSpecifier
+	HeaderFields    []string
+	HeaderFieldsNot []string
+}
+
+func bundleFetchItemSectionSpec(item any) *fetchSectionSpec {
+	var spec *fetchSectionSpec = nil
+
+	switch item := item.(type) {
+	case *imap.FetchItemBodySection:
+		spec = &fetchSectionSpec{
+			Part:            item.Part,
+			Specifier:       item.Specifier,
+			HeaderFields:    item.HeaderFields,
+			HeaderFieldsNot: item.HeaderFieldsNot,
+		}
+	case *imap.FetchItemBinarySection:
+		spec = &fetchSectionSpec{
+			Part:            item.Part,
+			Specifier:       item.Specifier,
+			HeaderFields:    item.HeaderFields,
+			HeaderFieldsNot: item.HeaderFieldsNot,
+		}
+	case *imap.FetchItemBinarySectionSize:
+		spec = &fetchSectionSpec{
+			Part:            item.Part,
+			Specifier:       item.Specifier,
+			HeaderFields:    item.HeaderFields,
+			HeaderFieldsNot: item.HeaderFieldsNot,
+		}
+	default:
+		panic(fmt.Sprintf("invalid fetch item type: %T", item))
+	}
+
+	return spec
+}
+
+func unbundleFetchItemSectionSpec(item any, spec *fetchSectionSpec) {
+	switch item := item.(type) {
+	case *imap.FetchItemBodySection:
+		item.Part = spec.Part
+		item.Specifier = spec.Specifier
+		item.HeaderFields = spec.HeaderFields
+		item.HeaderFieldsNot = spec.HeaderFieldsNot
+	case *imap.FetchItemBinarySection:
+		item.Part = spec.Part
+		item.Specifier = spec.Specifier
+		item.HeaderFields = spec.HeaderFields
+		item.HeaderFieldsNot = spec.HeaderFieldsNot
+	case *imap.FetchItemBinarySectionSize:
+		item.Part = spec.Part
+		item.Specifier = spec.Specifier
+		item.HeaderFields = spec.HeaderFields
+		item.HeaderFieldsNot = spec.HeaderFieldsNot
+	default:
+		panic(fmt.Sprintf("invalid fetch item type: %T", item))
+	}
+}
+
+func readFetchSectionSpec(dec *imapwire.Decoder) (*fetchSectionSpec, error) {
+	var spec fetchSectionSpec
+
 	var dot bool
-	section.Part, dot = readSectionPart(dec)
-	if dot || len(section.Part) == 0 {
+	spec.Part, dot = readFetchSectionSpecPartNums(dec)
+	if dot || len(spec.Part) == 0 {
 		var specifier string
 		if dot {
 			if !dec.ExpectAtom(&specifier) {
-				return dec.Err()
+				return nil, dec.Err()
 			}
 		} else {
 			dec.Atom(&specifier)
@@ -224,35 +336,31 @@ func readSection(dec *imapwire.Decoder, section *imap.FetchItemBodySection) erro
 
 		switch specifier := imap.PartSpecifier(strings.ToUpper(specifier)); specifier {
 		case imap.PartSpecifierNone, imap.PartSpecifierHeader, imap.PartSpecifierMIME, imap.PartSpecifierText:
-			section.Specifier = specifier
+			spec.Specifier = specifier
 		case "HEADER.FIELDS", "HEADER.FIELDS.NOT":
 			if !dec.ExpectSP() {
-				return dec.Err()
+				return nil, dec.Err()
 			}
 			var err error
 			headerList, err := readHeaderList(dec)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			section.Specifier = imap.PartSpecifierHeader
+			spec.Specifier = imap.PartSpecifierHeader
 			if specifier == "HEADER.FIELDS" {
-				section.HeaderFields = headerList
+				spec.HeaderFields = headerList
 			} else {
-				section.HeaderFieldsNot = headerList
+				spec.HeaderFieldsNot = headerList
 			}
 		default:
-			return newClientBugError("unknown body section specifier")
+			return nil, newClientBugError("unknown body section specifier")
 		}
 	}
 
-	if !dec.ExpectSpecial(']') {
-		return dec.Err()
-	}
-
-	return nil
+	return &spec, nil
 }
 
-func readSectionPart(dec *imapwire.Decoder) (part []int, dot bool) {
+func readFetchSectionSpecPartNums(dec *imapwire.Decoder) (part []int, dot bool) {
 	for {
 		dot = len(part) > 0
 		if dot && !dec.Special('.') {
@@ -385,29 +493,37 @@ func (w *FetchResponseWriter) WriteBodySection(section *imap.FetchItemBodySectio
 	if obs, ok := w.options.obsolete[section]; ok {
 		enc.Atom(obs)
 	} else {
-		writeItemBodySection(enc, section)
+		writeFetchItemBodySection(enc, section)
 	}
 
 	enc.SP()
 	return w.enc.Literal(size)
 }
 
-func writeItemBodySection(enc *imapwire.Encoder, section *imap.FetchItemBodySection) {
+func writeFetchItemBodySection(enc *imapwire.Encoder, section *imap.FetchItemBodySection) {
 	enc.Atom("BODY")
 	enc.Special('[')
-	writeSectionPart(enc, section.Part)
-	if len(section.Part) > 0 && section.Specifier != imap.PartSpecifierNone {
+	writeFetchSectionSpec(enc, bundleFetchItemSectionSpec(section))
+	enc.Special(']')
+	if partial := section.Partial; partial != nil {
+		enc.Special('<').Number(uint32(partial.Offset)).Special('>')
+	}
+}
+
+func writeFetchSectionSpec(enc *imapwire.Encoder, spec *fetchSectionSpec) {
+	writeSectionPart(enc, spec.Part)
+	if len(spec.Part) > 0 && spec.Specifier != imap.PartSpecifierNone {
 		enc.Special('.')
 	}
-	if section.Specifier != imap.PartSpecifierNone {
-		enc.Atom(string(section.Specifier))
+	if spec.Specifier != imap.PartSpecifierNone {
+		enc.Atom(string(spec.Specifier))
 
 		var headerList []string
-		if len(section.HeaderFields) > 0 {
-			headerList = section.HeaderFields
+		if len(spec.HeaderFields) > 0 {
+			headerList = spec.HeaderFields
 			enc.Atom(".FIELDS")
-		} else if len(section.HeaderFieldsNot) > 0 {
-			headerList = section.HeaderFieldsNot
+		} else if len(spec.HeaderFieldsNot) > 0 {
+			headerList = spec.HeaderFieldsNot
 			enc.Atom(".FIELDS.NOT")
 		}
 
@@ -416,10 +532,6 @@ func writeItemBodySection(enc *imapwire.Encoder, section *imap.FetchItemBodySect
 				enc.String(headerList[i])
 			})
 		}
-	}
-	enc.Special(']')
-	if partial := section.Partial; partial != nil {
-		enc.Special('<').Number(uint32(partial.Offset)).Special('>')
 	}
 }
 
@@ -432,19 +544,20 @@ func (w *FetchResponseWriter) WriteBinarySection(section *imap.FetchItemBinarySe
 	enc := w.enc.Encoder
 
 	enc.Atom("BINARY").Special('[')
-	writeSectionPart(enc, section.Part)
+	writeFetchSectionSpec(enc, bundleFetchItemSectionSpec(section))
 	enc.Special(']').SP()
 	enc.Special('~') // indicates literal8
 	return w.enc.Literal(size)
 }
 
 // WriteBinarySectionSize writes a binary section size.
+// TODO: should receive imap.FetchItemBinarySectionSize, not imap.FetchItemBinarySection.
 func (w *FetchResponseWriter) WriteBinarySectionSize(section *imap.FetchItemBinarySection, size uint32) {
 	w.writeItemSep()
 	enc := w.enc.Encoder
 
 	enc.Atom("BINARY.SIZE").Special('[')
-	writeSectionPart(enc, section.Part)
+	writeFetchSectionSpec(enc, bundleFetchItemSectionSpec(section))
 	enc.Special(']').SP().Number(size)
 }
 
